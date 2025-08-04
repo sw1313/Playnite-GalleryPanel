@@ -1,0 +1,8 @@
+﻿# extension.yaml ----------------------------
+Id: e946db98-2456-4beb-87d9-032cd602b902   
+Name: Gallery Panel
+Author: sw1313
+Version: 1.0.0
+Module: GalleryPanel.dll
+Type: GenericPlugin
+SupportedApiVersion: 2.3
