@@ -1,8 +1,6 @@
-﻿# extension.yaml ----------------------------
-Id: e946db98-2456-4beb-87d9-032cd602b902   
-Name: Gallery Panel
+﻿Id: 5B22F060-3027-4F4B-8C38-96F9E0F6D1C4
+Name: Description Translator
 Author: sw1313
-Version: 1.0.1
-Module: GalleryPanel.dll
+Version: 0.2.0
+Module: DescriptionTranslator.dll
 Type: GenericPlugin
-SupportedApiVersion: 2.3
