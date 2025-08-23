@@ -1,4 +1,5 @@
-﻿using Microsoft.Win32;
+﻿// ===== GalleryPanel.cs (Uri 优先加载 + 分页懒加载 + 并发限流 + 去抖) =====
+using Microsoft.Win32;
 using Ookii.Dialogs.Wpf;
 using Playnite.SDK;
 using Playnite.SDK.Models;
@@ -13,7 +14,6 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
-using System.Windows.Controls.Primitives;
 using System.Windows.Data;
 using System.Windows.Input;
 using System.Windows.Media;
@@ -92,14 +92,13 @@ namespace GalleryPanel
                 {
                     var dest = Path.Combine(dir, Path.GetFileName(s));
                     for (int i = 1; File.Exists(dest); i++)
-                        dest = Path.Combine(dir, string.Format("{0}_{1}{2}",
-                            Path.GetFileNameWithoutExtension(s), i, Path.GetExtension(s)));
+                        dest = Path.Combine(dir, $"{Path.GetFileNameWithoutExtension(s)}_{i}{Path.GetExtension(s)}");
                     File.Copy(s, dest);
                     ok++;
                 }
                 catch { fail++; }
             }
-            api.Dialogs.ShowMessage(string.Format("复制成功 {0} 张，失败 {1} 张。", ok, fail), "图库");
+            api.Dialogs.ShowMessage($"复制成功 {ok} 张，失败 {fail} 张。", "图库");
         }
 
         private void ClearGallery(Game g)
@@ -122,17 +121,31 @@ namespace GalleryPanel
     {
         private const int W = 200, H = 112, M = 4;
 
+        // ☆ 分页 + 限流 + 安全阈值
+        private const int PAGE_SIZE_IMAGES = 240;     // 每页 240 张（80 行）
+        private const int MAX_CONCURRENCY = 4;      // 同时解码 4 张
+        private const int MAX_INDEX_IMAGES = 1500;   // 目录最多索引 1500 张
+
         private readonly IPlayniteAPI api;
         private readonly ILogger log;
         private readonly Func<Guid, string> dirFn;
 
         private readonly ListBox list = new ListBox();
         private readonly ObservableCollection<RowInfo> rows = new ObservableCollection<RowInfo>();
-        private SemaphoreSlim gate;                        // 每次刷新重建
+
+        private SemaphoreSlim gate;                        // 解码并发
         private CancellationTokenSource cts = new CancellationTokenSource();
+
         private FileSystemWatcher watcher;
         private readonly DispatcherTimer poll = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(600) };
+        private readonly DispatcherTimer fswDebounce = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(300) }; // 去抖
         private Guid lastGameId = Guid.Empty;
+
+        private readonly ScrollViewer sv;
+        private List<string> allPics = new List<string>();
+        private int loadedCount = 0; // 已加载的图片数量
+
+        private Button loadMoreBtn; // “加载更多”按钮
 
         public GalleryHostControl(IPlayniteAPI api, ILogger log, Func<Guid, string> dirFn)
         {
@@ -148,12 +161,38 @@ namespace GalleryPanel
             list.BorderThickness = new Thickness(0);
             list.Background = Brushes.Transparent;
 
-            Content = new ScrollViewer
+            // ScrollViewer
+            sv = new ScrollViewer
             {
                 Content = list,
                 MaxHeight = 3 * (H + 2 * M),
                 VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
                 HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled
+            };
+            sv.ScrollChanged += OnScrollChanged;
+
+            // “加载更多”按钮
+            loadMoreBtn = new Button
+            {
+                Content = "加载更多",
+                Margin = new Thickness(6),
+                HorizontalAlignment = HorizontalAlignment.Center,
+                Visibility = Visibility.Collapsed
+            };
+            loadMoreBtn.Click += (_, __) => AppendNextPage(forceBeyondLimit: true);
+
+            // 根容器：列表 + 加载更多
+            var root = new DockPanel();
+            DockPanel.SetDock(loadMoreBtn, Dock.Bottom);
+            root.Children.Add(loadMoreBtn);
+            root.Children.Add(sv);
+            Content = root;
+
+            // 仅当控件可见时才工作
+            IsVisibleChanged += (_, __) =>
+            {
+                if (IsVisible) { poll.Start(); Refresh(); }
+                else { poll.Stop(); CancelWork(); }
             };
 
             poll.Tick += (_, __) =>
@@ -163,7 +202,9 @@ namespace GalleryPanel
                 if (id != lastGameId) Refresh();
             };
 
-            Loaded += (_, __) => { poll.Start(); Refresh(); };
+            fswDebounce.Tick += (_, __) => { fswDebounce.Stop(); Refresh(); };
+
+            Loaded += (_, __) => { if (IsVisible) { poll.Start(); Refresh(); } };
             Unloaded += (_, __) => { poll.Stop(); Dispose(); };
         }
 
@@ -188,11 +229,11 @@ namespace GalleryPanel
                 btn.SetValue(Button.BackgroundProperty, Brushes.Transparent);
                 btn.SetValue(Button.BorderBrushProperty, Brushes.Transparent);
                 btn.SetValue(FrameworkElement.CursorProperty, Cursors.Hand);
-                btn.SetBinding(Button.DataContextProperty, new System.Windows.Data.Binding(prop));
+                btn.SetBinding(Button.DataContextProperty, new Binding(prop));
                 btn.AddHandler(Button.ClickEvent, new RoutedEventHandler(OnClick));
 
                 btn.SetBinding(UIElement.VisibilityProperty,
-                    new System.Windows.Data.Binding("Path") { Converter = PathNullToCollapsedConverter.Instance });
+                    new Binding("Path") { Converter = PathNullToCollapsedConverter.Instance });
 
                 var container = new FrameworkElementFactory(typeof(Grid));
 
@@ -207,7 +248,7 @@ namespace GalleryPanel
                 img.SetValue(Image.WidthProperty, (double)W);
                 img.SetValue(Image.HeightProperty, (double)H);
                 img.SetValue(Image.StretchProperty, Stretch.UniformToFill);
-                img.SetBinding(Image.SourceProperty, new System.Windows.Data.Binding("Thumb"));
+                img.SetBinding(Image.SourceProperty, new Binding("Thumb"));
                 container.AppendChild(img);
 
                 btn.AppendChild(container);
@@ -215,15 +256,18 @@ namespace GalleryPanel
             }
         }
 
-        /*── 刷新 ─*/
+        /*── 刷新（轻：只做调度） ─*/
         private void Refresh()
         {
-            rows.Clear();
-            cts.Cancel(); cts = new CancellationTokenSource();
+            CancelWork(); // 先取消上一轮
 
-            watcher?.Dispose();
+            rows.Clear();
+            allPics.Clear();
+            loadedCount = 0;
+            loadMoreBtn.Visibility = Visibility.Collapsed;
+
             if (gate != null) gate.Dispose();
-            gate = new SemaphoreSlim(4);  // 关键：每次刷新重建信号量
+            gate = new SemaphoreSlim(MAX_CONCURRENCY);
 
             var g = api.MainView.SelectedGames?.FirstOrDefault();
             if (g == null) { lastGameId = Guid.Empty; return; }
@@ -232,39 +276,133 @@ namespace GalleryPanel
             string dir = dirFn(g.Id);
             if (!Directory.Exists(dir)) return;
 
-            var pics = Directory.EnumerateFiles(dir)
-                                .Where(f => new[] { ".png", ".jpg", ".jpeg", ".gif", ".webp" }
-                                .Contains(Path.GetExtension(f).ToLower()))
-                                .OrderBy(f => f).ToList();
+            // 后台枚举目录，UI 不阻塞
+            _ = LoadIndexAsync(dir, cts.Token);
 
-            for (int i = 0; i < pics.Count; i += 3)
-                rows.Add(new RowInfo(pics.Skip(i).Take(3).ToArray(), gate, cts.Token));
+            // 监控目录变化（去抖）
+            watcher?.Dispose();
+            watcher = new FileSystemWatcher(dir)
+            {
+                IncludeSubdirectories = false,
+                NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite | NotifyFilters.CreationTime,
+                EnableRaisingEvents = true
+            };
+            watcher.Created += (_, __) => { fswDebounce.Stop(); fswDebounce.Start(); };
+            watcher.Deleted += (_, __) => { fswDebounce.Stop(); fswDebounce.Start(); };
+            watcher.Renamed += (_, __) => { fswDebounce.Stop(); fswDebounce.Start(); };
+        }
 
-            watcher = new FileSystemWatcher(dir) { EnableRaisingEvents = true };
-            watcher.Created += (_, __) => Dispatcher.Invoke(Refresh);
-            watcher.Deleted += (_, __) => Dispatcher.Invoke(Refresh);
-            watcher.Renamed += (_, __) => Dispatcher.Invoke(Refresh);
+        private void CancelWork()
+        {
+            try { cts.Cancel(); } catch { }
+            cts = new CancellationTokenSource();
+            watcher?.Dispose();
+        }
+
+        // 后台枚举 + 首屏加载
+        private async Task LoadIndexAsync(string dir, CancellationToken ct)
+        {
+            List<string> files = null;
+            await Task.Run(() =>
+            {
+                ct.ThrowIfCancellationRequested();
+                try
+                {
+                    files = Directory.EnumerateFiles(dir)
+                        .Where(f =>
+                        {
+                            var e = Path.GetExtension(f);
+                            return !string.IsNullOrEmpty(e) && (e.Equals(".png", StringComparison.OrdinalIgnoreCase)
+                                || e.Equals(".jpg", StringComparison.OrdinalIgnoreCase)
+                                || e.Equals(".jpeg", StringComparison.OrdinalIgnoreCase)
+                                || e.Equals(".gif", StringComparison.OrdinalIgnoreCase)
+                                || e.Equals(".webp", StringComparison.OrdinalIgnoreCase));
+                        })
+                        .OrderBy(f => f)
+                        .Take(MAX_INDEX_IMAGES)   // ☆ 硬上限
+                        .ToList();
+                }
+                catch { files = new List<string>(); }
+            }, ct).ConfigureAwait(false);
+
+            if (ct.IsCancellationRequested) return;
+
+            allPics = files ?? new List<string>();
+
+            // 粗略判断是否超限
+            bool hasMore = false;
+            try
+            {
+                hasMore = Directory.EnumerateFiles(dir).Count(p =>
+                {
+                    var e = Path.GetExtension(p);
+                    return !string.IsNullOrEmpty(e) && (e.Equals(".png", StringComparison.OrdinalIgnoreCase)
+                        || e.Equals(".jpg", StringComparison.OrdinalIgnoreCase)
+                        || e.Equals(".jpeg", StringComparison.OrdinalIgnoreCase)
+                        || e.Equals(".gif", StringComparison.OrdinalIgnoreCase)
+                        || e.Equals(".webp", StringComparison.OrdinalIgnoreCase));
+                }) > MAX_INDEX_IMAGES;
+            }
+            catch { }
+
+            _ = Dispatcher.BeginInvoke(new Action(() =>
+            {
+                if (hasMore) loadMoreBtn.Visibility = Visibility.Visible;
+                AppendNextPage(); // 首屏
+            }), DispatcherPriority.Background);
+        }
+
+        /*── 触底加载 ─*/
+        private void OnScrollChanged(object sender, ScrollChangedEventArgs e)
+        {
+            if (e.VerticalChange <= 0) return;
+            if (sv.ScrollableHeight <= 0) return;
+
+            double ratio = (sv.VerticalOffset + sv.ViewportHeight) / (sv.ExtentHeight);
+            if (ratio >= 0.92) AppendNextPage();
+        }
+
+        // 追加一页（可选突破上限：用户点击“加载更多”才会继续超过 MAX_INDEX_IMAGES）
+        private void AppendNextPage(bool forceBeyondLimit = false)
+        {
+            if (allPics == null || allPics.Count == 0) return;
+
+            int cap = forceBeyondLimit ? allPics.Count : Math.Min(allPics.Count, MAX_INDEX_IMAGES);
+            if (loadedCount >= cap) return;
+
+            int end = Math.Min(loadedCount + PAGE_SIZE_IMAGES, cap);
+            for (int i = loadedCount; i < end; i += 3)
+            {
+                var slice = allPics.Skip(i).Take(3).ToArray();
+                rows.Add(new RowInfo(slice, gate, cts.Token));
+            }
+            loadedCount = end;
         }
 
         /*── 点击缩略图 ─*/
         private void OnClick(object sender, RoutedEventArgs e)
         {
-            var btn = sender as Button;
-            if (btn != null && btn.DataContext is ThumbItem)
-            {
-                var ti = (ThumbItem)btn.DataContext;
-                if (!string.IsNullOrEmpty(ti.Path)) ShowViewer(ti.Path);
-            }
+            if (sender is Button btn && btn.DataContext is ThumbItem ti && !string.IsNullOrEmpty(ti.Path))
+                ShowViewer(ti.Path);
         }
 
         /*── 全屏查看器 ─*/
         private void ShowViewer(string startPath)
         {
             var dir = Path.GetDirectoryName(startPath);
-            var list = Directory.EnumerateFiles(dir)
-                                .Where(p => new[] { ".png", ".jpg", ".jpeg", ".gif", ".webp" }
-                                .Contains(Path.GetExtension(p).ToLower()))
-                                .OrderBy(p => p).ToList();
+            List<string> list;
+            try
+            {
+                list = Directory.EnumerateFiles(dir)
+                    .Where(p =>
+                    {
+                        var e = Path.GetExtension(p)?.ToLower();
+                        return e == ".png" || e == ".jpg" || e == ".jpeg" || e == ".gif" || e == ".webp";
+                    })
+                    .OrderBy(p => p).ToList();
+            }
+            catch { return; }
+
             int idx = Math.Max(0, list.IndexOf(startPath));
 
             var win = new Window { WindowStyle = WindowStyle.None, WindowState = WindowState.Maximized, Background = Brushes.Black };
@@ -272,9 +410,22 @@ namespace GalleryPanel
 
             void Load()
             {
-                var bmp = new BitmapImage();
-                bmp.BeginInit(); bmp.CacheOption = BitmapCacheOption.OnLoad; bmp.UriSource = new Uri(list[idx]); bmp.EndInit();
-                bmp.Freeze(); img.Source = bmp;
+                try
+                {
+                    var path = list[idx];
+                    if (ThumbItem.TryLoadWithUri(path, null, out var bi) || ThumbItem.TryLoadWithStream(path, null, out bi))
+                    {
+                        img.Source = bi;
+                    }
+                    else
+                    {
+                        img.Source = null;
+                    }
+                }
+                catch
+                {
+                    img.Source = null;
+                }
             }
             Load();
 
@@ -324,8 +475,8 @@ namespace GalleryPanel
         public void Dispose()
         {
             try { cts.Cancel(); } catch { }
-            if (gate != null) gate.Dispose();
-            if (watcher != null) watcher.Dispose();
+            gate?.Dispose();
+            watcher?.Dispose();
         }
 
         /*──────── 数据结构 ────────*/
@@ -346,30 +497,33 @@ namespace GalleryPanel
                     int idx = i;
                     Task.Run(async () =>
                     {
-                        await gate.WaitAsync(token).ConfigureAwait(false);
+                        try { await gate.WaitAsync(token).ConfigureAwait(false); }
+                        catch (OperationCanceledException) { return; }
+
                         try
                         {
                             var bmp = await ThumbItem.DecodeAsync(paths[idx], token).ConfigureAwait(false);
-                            Application.Current.Dispatcher.Invoke(() =>
+                            Application.Current?.Dispatcher.BeginInvoke(new Action(() =>
                             {
                                 switch (idx)
                                 {
-                                    case 0: A.Thumb = bmp; On(nameof(A)); break;
-                                    case 1: B.Thumb = bmp; On(nameof(B)); break;
-                                    case 2: C.Thumb = bmp; On(nameof(C)); break;
+                                    case 0: if (A != null) { A.Thumb = bmp; On(nameof(A)); } break;
+                                    case 1: if (B != null) { B.Thumb = bmp; On(nameof(B)); } break;
+                                    case 2: if (C != null) { C.Thumb = bmp; On(nameof(C)); } break;
                                 }
-                            });
+                            }), DispatcherPriority.Background);
                         }
+                        catch { /* 忽略坏图或取消 */ }
                         finally
                         {
-                            gate.Release();
+                            try { gate.Release(); } catch { }
                         }
                     }, token);
                 }
             }
 
             public event PropertyChangedEventHandler PropertyChanged;
-            private void On(string n) { var h = PropertyChanged; if (h != null) h(this, new PropertyChangedEventArgs(n)); }
+            private void On(string n) { var h = PropertyChanged; h?.Invoke(this, new PropertyChangedEventArgs(n)); }
         }
 
         private sealed class ThumbItem : INotifyPropertyChanged
@@ -379,8 +533,8 @@ namespace GalleryPanel
             private ImageSource _thumb;
             public ImageSource Thumb
             {
-                get { return _thumb; }
-                set { _thumb = value; var h = PropertyChanged; if (h != null) h(this, new PropertyChangedEventArgs(nameof(Thumb))); }
+                get => _thumb;
+                set { _thumb = value; PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(Thumb))); }
             }
 
             public static Task<BitmapImage> DecodeAsync(string p, CancellationToken ct)
@@ -388,15 +542,81 @@ namespace GalleryPanel
                 return Task.Run(() =>
                 {
                     ct.ThrowIfCancellationRequested();
-                    var bmp = new BitmapImage();
-                    bmp.BeginInit();
-                    bmp.DecodePixelWidth = W;                 // 解码时缩放
-                    bmp.CacheOption = BitmapCacheOption.OnLoad;
-                    bmp.UriSource = new Uri(p);
-                    bmp.EndInit();
-                    bmp.Freeze();
-                    return bmp;
+
+                    // 先 Uri，再 Stream，最后占位
+                    if (TryLoadWithUri(p, W, out var bmp)) return bmp;
+                    if (TryLoadWithStream(p, W, out bmp)) return bmp;
+                    return BuildPlaceholder();
                 }, ct);
+            }
+
+            // —— 供缩略图与查看器共用的加载工具 —— //
+            internal static bool TryLoadWithUri(string path, int? decodeWidth, out BitmapImage bmp)
+            {
+                bmp = null;
+                try
+                {
+                    var full = System.IO.Path.GetFullPath(path);
+                    var uri = new Uri(full, UriKind.Absolute);
+
+                    var bi = new BitmapImage();
+                    bi.BeginInit();
+                    if (decodeWidth.HasValue) bi.DecodePixelWidth = decodeWidth.Value;
+                    bi.CacheOption = BitmapCacheOption.OnLoad;            // 读完即释放句柄
+                    bi.CreateOptions = BitmapCreateOptions.IgnoreImageCache;
+                    bi.UriSource = uri;
+                    bi.EndInit();
+                    bi.Freeze();
+                    bmp = bi;
+                    return true;
+                }
+                catch
+                {
+                    return false;
+                }
+            }
+
+            internal static bool TryLoadWithStream(string path, int? decodeWidth, out BitmapImage bmp)
+            {
+                bmp = null;
+                try
+                {
+                    using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                    {
+                        var bi = new BitmapImage();
+                        bi.BeginInit();
+                        if (decodeWidth.HasValue) bi.DecodePixelWidth = decodeWidth.Value;
+                        bi.CacheOption = BitmapCacheOption.OnLoad;
+                        bi.CreateOptions = BitmapCreateOptions.IgnoreImageCache;
+                        bi.StreamSource = fs;
+                        bi.EndInit();
+                        bi.Freeze();
+                        bmp = bi;
+                        return true;
+                    }
+                }
+                catch
+                {
+                    return false;
+                }
+            }
+
+            internal static BitmapImage BuildPlaceholder()
+            {
+                // 1x1 透明 PNG 占位
+                var ms = new MemoryStream(new byte[]
+                {
+                    137,80,78,71,13,10,26,10,0,0,0,13,73,72,68,82,0,0,0,1,0,0,0,1,8,6,0,0,0,31,21,196,137,
+                    0,0,0,10,73,68,65,84,120,156,99,0,1,0,0,5,0,1,13,10,44,10,
+                    0,0,0,0,73,69,78,68,174,66,96,130
+                });
+                var bi = new BitmapImage();
+                bi.BeginInit();
+                bi.CacheOption = BitmapCacheOption.OnLoad;
+                bi.StreamSource = ms;
+                bi.EndInit();
+                bi.Freeze();
+                return bi;
             }
 
             public event PropertyChangedEventHandler PropertyChanged;
@@ -404,7 +624,7 @@ namespace GalleryPanel
     }
 
     /*──────── null → Collapsed ────────*/
-    internal class PathNullToCollapsedConverter : System.Windows.Data.IValueConverter
+    internal class PathNullToCollapsedConverter : IValueConverter
     {
         public static readonly PathNullToCollapsedConverter Instance = new PathNullToCollapsedConverter();
         public object Convert(object v, Type t, object p, System.Globalization.CultureInfo c)
